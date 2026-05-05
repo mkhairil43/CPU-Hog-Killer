@@ -31,18 +31,18 @@ Having a rooted device, I noticed executing the <code>top</code> command sometim
 • **Keeps an Eye on CPU Usage**: Monitors running processes and calculates their average CPU usage.<br><br>
 • **Auto-Kills Rogue Processes**: If a process consistently uses more CPU than a set threshold, the module will terminate it.<br><br>
 • **Improves Battery Life**: Aims to reduce battery drain and heat by keeping resource-heavy apps in check.<br><br>
-• **Notifies you about killed processes**: It notifies you when it kills a process, so you can both be kept in the loop about what's going on with your device, and be alerted when an app is constantly restarting on it's own and eating the CPU, so you can take some action, like restricting it's battery usage permissions.
+• **Notifies you about killed processes**: It notifies you when it kills a process, so you can both be kept in the loop about what's going on with your device and be alerted when an app is constantly restarting on its own and eating the CPU, so you can take some action, like restricting its battery usage permissions.
 
 ### How does it work?
 
-Let's say a rogue app is using 100% of a CPU in the background, while you're not even using your phone. This magisk module runs a constant non CPU intensive script. Every certain amount of time, it checks if your screen is off, and if it is, it will start monitoring the running processes / apps. First, it will get the top 5 CPU intensive processes / apps, each with their CPU usage. It will give them a certain amount of chances to turn that CPU usage down, while calculating how much CPU they are using on average, and if they don't, after they reach a certain amount of chances, it will check if their average CPU usage is over a pre determined threshold. If it is, the process will be killed, and the user will receive a notification about the CPU intensive process / app that was killed, so they can remove their battery usage permissions.
+Let's say a rogue app is using 100% of a CPU in the background, while you're not even using your phone. This Magisk module runs a constant non-CPU-intensive script. Every certain amount of time, it checks if your screen is off, and if it is, it will start monitoring the running processes/apps. First, it will get the top 5 CPU-intensive processes/apps, each with their CPU usage. It will give them a certain amount of chances to turn that CPU usage down, while calculating how much CPU they are using on average, and if they don't, after they reach a certain amount of chances, it will check if their average CPU usage is over a predetermined threshold. If it is, the process will be killed, and the user will receive a notification about the CPU-intensive process/app that was killed, so they can remove their battery usage permissions.
 
-This way, no mattery what Android phone brand you have, what custom ROM you might have installed, or what firmware version, you can rest assured your phone will run cool, and the battery will not be consumed by background processes / apps.
+This way, no matter what Android phone brand you have, what custom ROM you might have installed, or what firmware version, you can rest assured your phone will run cool, and the battery will not be consumed by background processes/apps.
 
 ### FAQ
 1. Why does it keep notifying me of a killed process?
 
-    If that happens, then you have yourself a rogue app or process. If it's an app, open it's App Info, and restrict it's battery usage.
+    If that happens, then you have yourself a rogue app or process. If it's an app, open its App Info and restrict its battery usage.
 
 2. Does it create a log anywhere, so I can see what it's doing?
 
