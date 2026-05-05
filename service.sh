@@ -36,6 +36,3 @@ echo "MODPATH: $MODPATH"
 # Start the CPU hog killer script with an absolute path
 chmod 755 "$MODPATH/cpu_hog_killer.sh"
 /system/bin/sh "$MODPATH/cpu_hog_killer.sh"
-
-# Log that the script has started
-echo "Service script started."

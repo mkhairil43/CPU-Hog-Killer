@@ -30,8 +30,8 @@ REPLACE="
 ##########################################################################################
 
 set_permissions() {
-  # Set permissions for the modified init.rc file
-  set_perm $MODPATH/system/etc/init/hw/init.rc 0 0 0644
+  # No custom permissions needed - default permissions are set by common/functions.sh
+  :
 }
 
 ##########################################################################################

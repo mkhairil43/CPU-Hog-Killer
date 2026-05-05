@@ -1,101 +1,124 @@
 #!/system/bin/sh
-# set -x
+#
+# CPU Hog Killer - Monitors and terminates processes with excessive CPU usage
+# Designed for Android devices (Magisk/KernelSU module)
+#
 
-# echo "$(date '+%Y-%m-%d %H:%M:%S') Current shell: $SHELL"
-
+##########################################################################################
 # Configuration
-SAMPLE_INTERVAL=10                  # Interval between CPU usage samples in seconds
-MONITOR_DURATION=60                 # Total duration to monitor each process (e.g., 300 seconds = 5 minutes)
-CPU_THRESHOLD=30                    # CPU usage threshold (in percent)
-# CPU_THRESHOLD=5                    # Testing CPU usage threshold (in percent)
-TOP_PROCESSES_COUNT=5               # Number of top processes to monitor
-MEASUREMENTS_LIMIT=5                # Number of measurements before killing the process
-# MEASUREMENTS_LIMIT=1                # Testing Number of measurements before killing the process
-INITIAL_SLEEP_TIME=60               # Initial number of seconds to wait for the next run, when the screen is off.
-HIGH_PRIORITY_MULTIPLIER=3          # How many times bigger the CPU usage has to be to kill a high priority process, like system_server.
-ORIGINAL_SELINUX=$(getenforce)      # Backup the original SELinux Status.
-WHITE_LIST="toybox|android.system.suspend-service|audioserver|android.hardware.audio.service_64"    # Whitelisted processes / apps.
-MONITORING_RUNS=0                   # Number of times the processes were monitored.
-MONITORING_SKIPS=0                  # This indicates how many times the script should skip the monitoring during the device idle check loop.
-REMAINING_MONITORING_SKIPS=0        # Amount of the next monitoring runs that will be skipped.
-SYSTEM_INSTABILITY_REPORTED=0       # This variable defines if the system as been reported as unstable or not.
+##########################################################################################
 
-# Function to cleanup measurements
-cleanup() {
-    # Reset all measurements
-    pids=()                   # Clear the PID array
-    avg_cpu_usage=()          # Clear the average CPU usage array
-    measurements_count=()     # Clear the measurements count array
+SAMPLE_INTERVAL=10                  # Interval between CPU usage samples in seconds
+MONITOR_DURATION=60                 # Total duration to monitor each process (seconds)
+CPU_THRESHOLD=30                    # CPU usage threshold (percent)
+TOP_PROCESSES_COUNT=5               # Number of top processes to monitor
+MEASUREMENTS_LIMIT=5                # Number of measurements before killing process
+INITIAL_SLEEP_TIME=60               # Initial wait time when screen is off (seconds)
+HIGH_PRIORITY_MULTIPLIER=3          # Multiplier for high-priority processes (e.g., system_server)
+WHITE_LIST="toybox|android.system.suspend-service|audioserver|android.hardware.audio.service_64"
+
+##########################################################################################
+# Global Variables
+##########################################################################################
+
+ORIGINAL_SELINUX=""                 # Backup of original SELinux status
+MONITORING_SKIPS=0                  # Number of times monitoring was skipped
+REMAINING_MONITORING_SKIPS=0        # Remaining skips before next monitoring run
+SYSTEM_INSTABILITY_REPORTED=0       # Flag indicating if system instability was reported
+MONITOR_WAIT_TIME=$INITIAL_SLEEP_TIME  # Current wait time between monitoring cycles
+
+# Arrays for tracking process measurements (using associative arrays)
+declare -A pids                     # Process IDs being tracked
+declare -A avg_cpu_usage            # Cumulative CPU usage per PID
+declare -A measurements_count       # Number of measurements per PID
+
+##########################################################################################
+# Initialization
+##########################################################################################
+
+init_globals() {
+    ORIGINAL_SELINUX=$(getenforce)
+    MONITORING_SKIPS=0
+    REMAINING_MONITORING_SKIPS=0
+    SYSTEM_INSTABILITY_REPORTED=0
+    MONITOR_WAIT_TIME=$INITIAL_SLEEP_TIME
+}
+
+##########################################################################################
+# Utility Functions
+##########################################################################################
+
+# Cleanup all process measurements
+cleanup_measurements() {
+    pids=()
+    avg_cpu_usage=()
+    measurements_count=()
     unset pids avg_cpu_usage measurements_count
+    declare -A pids
+    declare -A avg_cpu_usage
+    declare -A measurements_count
     echo "$(date '+%Y-%m-%d %H:%M:%S') All previous measurements cleared."
 }
 
-# Function to check if the system is idle (not charging and screen is locked)
+# Trim whitespace and extract the first word from a string
+trim_and_extract_command() {
+    echo "$1" | awk '{print $1}'
+}
+
+# Send notification when a process is killed
+send_notification() {
+    local title="$1"
+    local message="$2"
+
+    setenforce 0
+    su -lp 2000 -c "cmd notification post -S bigtext -t '$title' 'Tag' '$message'"
+    setenforce "$ORIGINAL_SELINUX"
+}
+
+##########################################################################################
+# System State Functions
+##########################################################################################
+
+# Check if the system is idle (not charging and screen is locked)
 should_monitor() {
-    # Get device idle states
-    local device_idle_info=$(dumpsys deviceidle | grep -E 'mScreenLocked|mScreenOn|mCharging')
+    local device_idle_info screen_locked screen_on charging
 
-    # echo "$device_idle_info"
+    device_idle_info=$(dumpsys deviceidle | grep -E 'mScreenLocked|mScreenOn|mCharging')
 
-    # Extract relevant values
-    local screen_locked=$(echo "$device_idle_info" | grep -o 'mScreenLocked=[^ ]*' | awk -F '=' '{print $2}')
-    local screen_on=$(echo "$device_idle_info" | grep -o 'mScreenOn=[^ ]*' | awk -F '=' '{print $2}')
-    local charging=$(echo "$device_idle_info" | grep -o 'mCharging=[^ ]*' | awk -F '=' '{print $2}')  # Fixed the missing quote
+    screen_locked=$(echo "$device_idle_info" | grep -o 'mScreenLocked=[^ ]*' | awk -F '=' '{print $2}')
+    screen_on=$(echo "$device_idle_info" | grep -o 'mScreenOn=[^ ]*' | awk -F '=' '{print $2}')
+    charging=$(echo "$device_idle_info" | grep -o 'mCharging=[^ ]*' | awk -F '=' '{print $2}')
 
-    # echo "Screen On: $screen_on"
-    # echo "Screen Locked: $screen_locked"
-    # echo "Charging: $charging"
-
-    # Check if the system is not charging and screen is locked
     if [[ "$screen_on" == "false" && "$charging" == "false" && "$screen_locked" == "true" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') The system is idle."
-        return 0  # System is not charging and screen is locked
+        return 0
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') System is either charging, unlocked, or the screen is on. Sleeping for $MONITOR_WAIT_TIME seconds…"
         if [ "$MONITORING_SKIPS" -ne 0 ] || [ "$REMAINING_MONITORING_SKIPS" -ne 0 ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') Resetting the loop skips to 0…"
-                MONITORING_SKIPS=0
-                REMAINING_MONITORING_SKIPS=0
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Resetting the loop skips to 0…"
+            MONITORING_SKIPS=0
+            REMAINING_MONITORING_SKIPS=0
         fi
-    fi
-    return 1  # System is either charging or unlocked
-}
-
-# Function to echo the result of should_monitor
-echo_should_monitor_result() {
-    should_monitor
-    local result=$?
-
-    # Print the result of should_monitor
-    if [[ $result -eq 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') System is not charging and the screen is locked."
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') System is either charging, unlocked, or the screen is on."
+        return 1
     fi
 }
-# echo_should_monitor_result
 
-# Function to get the package name of the playing app, if there's media playing.
+# Get the package name of the app with playing media
 get_playing_media_package_name() {
-    # Get the dumpsys media_session output
+    local output previous_line playing_package line
+
     output=$(dumpsys media_session | grep -E "(PLAYING|package=)")
+    playing_package=""
+    previous_line=""
 
-    # Initialize variables
-    local playing_package=""
-    local previous_line=""
-
-    # Iterate through the output line by line
     while IFS= read -r line; do
         if [[ "$line" == *"state=PLAYING"* ]]; then
-            # The previous line should contain the package
             playing_package=$(echo "$previous_line" | cut -d'=' -f2)
             break
         fi
-        # Update the previous line
         previous_line="$line"
     done <<< "$output"
 
-    # Output the package name or a message
     if [ -n "$playing_package" ]; then
         echo "$playing_package"
     else
@@ -103,16 +126,15 @@ get_playing_media_package_name() {
     fi
 }
 
-# Function to check for ongoing or ringing calls
+# Check for ongoing or ringing calls
 check_for_ongoing_calls() {
-    # Get telephony registry info
-    local telephony_info=$(dumpsys telephony.registry | grep -E 'mForegroundCallState|mRingingCallState')
+    local telephony_info foreground_call_states ringing_call_states state
 
-    # Extract call states
-    local foreground_call_states=$(echo "$telephony_info" | grep -o 'mForegroundCallState=[^ ]*' | awk -F '=' '{print $2}')
-    local ringing_call_states=$(echo "$telephony_info" | grep -o 'mRingingCallState=[^ ]*' | awk -F '=' '{print $2}')
+    telephony_info=$(dumpsys telephony.registry | grep -E 'mForegroundCallState|mRingingCallState')
 
-    # Check if any call state is active (not 0 means active)
+    foreground_call_states=$(echo "$telephony_info" | grep -o 'mForegroundCallState=[^ ]*' | awk -F '=' '{print $2}')
+    ringing_call_states=$(echo "$telephony_info" | grep -o 'mRingingCallState=[^ ]*' | awk -F '=' '{print $2}')
+
     for state in $foreground_call_states $ringing_call_states; do
         if [[ "$state" -ne 0 ]]; then
             return 0  # True: There is an ongoing call or the phone is ringing
@@ -120,160 +142,211 @@ check_for_ongoing_calls() {
     done
     return 1  # False: No ongoing or ringing calls
 }
-# echo "$check_for_ongoing_calls"
 
-# Function to trim whitespace and extract the first word
-trim_and_extract_command() {
-    # Extract the first word from the ARGS string and print it
-    echo "$1" | awk '{print $1}'
+##########################################################################################
+# Process Management Functions
+##########################################################################################
+
+# Report system instability for critical processes
+report_system_instability() {
+    local cmd="$1"
+    local formatted_avg_cpu="$2"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Reporting the system as unstable… $cmd is using $formatted_avg_cpu% of the CPU on average."
+    send_notification "High CPU Usage Detected" "The process $cmd is using a high amount of CPU (Average Usage: $formatted_avg_cpu%). It can not be killed without causing a reboot. To debug it, use \"top -H\" via ADB."
 }
 
-# Function to send notification when a process is killed
-send_notification() {
-    local cmd=$1
-    local avg_cpu=$2
-    su -lp 2000 -c "cmd notification post -S bigtext -t 'Title' 'Tag' 'Multiline text'"
+# Kill a process and send notification
+kill_process_with_notification() {
+    local pid="$1"
+    local cmd="$2"
+    local formatted_avg_cpu="$3"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Killing process $cmd (Average CPU usage: $formatted_avg_cpu%)"
+    kill "$pid"
+    send_notification "$cmd Killed" "Average CPU Usage: $formatted_avg_cpu%"
 }
 
-# Function to monitor CPU usage and analyze the top processes
-monitor_and_analyze() {
-    check_for_ongoing_calls
-    if [[ $? -eq 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') There is an ongoing call or the phone is ringing"
-        return 1 # Exit the function to resume in the next cycle
+# Display top processes with their statistics
+display_top_processes() {
+    local current_top=("$@")
+    local entry pid cpu cmd avg_cpu
+
+    echo "Top $TOP_PROCESSES_COUNT CPU-consuming processes:"
+    for entry in "${current_top[@]}"; do
+        read pid cpu cmd <<< "$entry"
+        if [ "${measurements_count[$pid]}" -gt 0 ]; then
+            avg_cpu=$(echo "${avg_cpu_usage[$pid]} / ${measurements_count[$pid]}" | bc -l)
+            avg_cpu=$(printf "%.2f" "$avg_cpu")
+            echo "PID: $pid, CPU%: $cpu, AVG-CPU%: $avg_cpu, Command: $cmd, Measurements: ${measurements_count[$pid]}"
+        fi
+    done
+}
+
+# Get command name from process info
+get_command_name() {
+    local pid="$1"
+    local comm="$2"
+    local args cmd
+
+    if [[ "$comm" == "app_process64" ]]; then
+        args=$(ps -f -eo args -p "$pid" | head -n 2 | tail -n +2)
+        if [ -n "$args" ]; then
+            cmd=$(trim_and_extract_command "$args")
+            [ -z "$cmd" ] && cmd="app_process64 (no arguments)"
+        else
+            cmd="app_process64 (no ARGS)"
+        fi
+    else
+        cmd=$comm
     fi
-    cleanup  # Call cleanup before starting the monitoring.
+
+    echo "$cmd"
+}
+
+# Process a single CPU measurement for a PID
+process_cpu_measurement() {
+    local pid="$1"
+    local cpu="$2"
+    local cmd="$3"
+    local avg_cpu formatted_avg_cpu playing_media_package
+
+    # Initialize tracking for new PIDs
+    if [[ -z "${pids[$pid]}" ]]; then
+        pids[$pid]=$pid
+        avg_cpu_usage[$pid]=0
+        measurements_count[$pid]=0
+    fi
+
+    # Accumulate CPU usage and increment measurement count
+    avg_cpu_usage[$pid]=$(echo "${avg_cpu_usage[$pid]} + $cpu" | bc)
+    measurements_count[$pid]=$((measurements_count[$pid] + 1))
+
+    # Check if we have enough measurements to make a decision
+    if (( measurements_count[$pid] >= MEASUREMENTS_LIMIT )); then
+        avg_cpu=$(echo "${avg_cpu_usage[$pid]} / ${measurements_count[$pid]}" | bc -l)
+        formatted_avg_cpu=$(printf "%.2f" "$avg_cpu")
+
+        # Handle high-priority processes (system_server) differently
+        if [[ "$cmd" == "system_server" ]]; then
+            if (( $(echo "$avg_cpu > $((CPU_THRESHOLD * $HIGH_PRIORITY_MULTIPLIER))" | bc -l) )) && \
+               [ "$SYSTEM_INSTABILITY_REPORTED" -eq 0 ]; then
+                report_system_instability "$cmd" "$formatted_avg_cpu"
+                return 10  # Signal to add 10 seconds
+            fi
+        else
+            # Regular process handling
+            if (( $(echo "$avg_cpu > $CPU_THRESHOLD" | bc -l) )); then
+                playing_media_package=$(get_playing_media_package_name)
+                if [[ "$cmd" == "$playing_media_package" ]]; then
+                    echo "The package to be killed $cmd is playing media. Skipping…"
+                else
+                    kill_process_with_notification "$pid" "$cmd" "$formatted_avg_cpu"
+                    return 10  # Signal to add 10 seconds
+                fi
+            fi
+        fi
+    fi
+    return 0
+}
+
+##########################################################################################
+# CPU Monitoring Functions
+##########################################################################################
+
+# Monitor CPU usage and analyze top processes
+monitor_and_analyze() {
+    local TIME_SPENT top_processes current_top pid user comm cpu cmd
+    local avg_cpu formatted_avg_cpu entry time_adjustment
+
+    # Check for ongoing calls - skip monitoring if calls are active
+    if check_for_ongoing_calls; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') There is an ongoing call or the phone is ringing"
+        return 1
+    fi
+
+    cleanup_measurements
     echo "$(date '+%Y-%m-%d %H:%M:%S') Monitoring CPU usage for $MONITOR_DURATION seconds..."
     TIME_SPENT=0
+
     while [ "$TIME_SPENT" -lt "$MONITOR_DURATION" ]; do
-        # Check if the system is idle at the beginning of each iteration
-        should_monitor
-        if [[ $? -ne 0 ]]; then
-            return 1 # Exit the function to resume in the next cycle
+        # Check if system is still idle
+        if ! should_monitor; then
+            return 1
         fi
 
         echo "$(date '+%Y-%m-%d %H:%M:%S') Collecting CPU usage snapshot at $TIME_SPENT seconds..."
 
-        # Get the top processes consuming the most CPU by comm
-        # top_processes=$(ps -f -eo pid,user,comm,%cpu --sort=-%cpu | head -n "$((TOP_PROCESSES_COUNT + 1))")  # +1 to skip the header
-        top_processes=$(top -b -n 1 -o pid,user,comm,%cpu | tail -n +6 | grep -Ev "$WHITE_LIST" | head -n "$((TOP_PROCESSES_COUNT + 1))")  # +1 to skip the header and irrelevant lines
+        # Get top CPU-consuming processes (excluding whitelisted ones)
+        top_processes=$(top -b -n 1 -o pid,user,comm,%cpu | tail -n +6 | grep -Ev "$WHITE_LIST" | head -n "$((TOP_PROCESSES_COUNT + 1))")
 
-        # Array to track current top processes
         current_top=()
 
-        # Read the output line by line
+        # Process each line of top output
         while read -r pid user comm cpu; do
-            # Filter out empty CPU usage and header
-            if [ ! -z "$cpu" ] && [ "$pid" != "PID" ]; then
-                # Initialize process data if PID is not already tracked
-                if [[ -z "${pids[$pid]}" ]]; then
-                    pids[$pid]=$pid
-                    avg_cpu_usage[$pid]=0
-                    measurements_count[$pid]=0
-                fi
+            # Skip empty entries and header
+            if [ -z "$cpu" ] || [ "$pid" = "PID" ]; then
+                continue
+            fi
 
-                # Update the CPU usage and increment measurement count
-                avg_cpu_usage[$pid]=$(echo "${avg_cpu_usage[$pid]} + $cpu" | bc)
-                measurements_count[$pid]=$((measurements_count[$pid] + 1))
+            # Get command name
+            cmd=$(get_command_name "$pid" "$comm")
 
-                # Determine the command name
-                if [[ "$comm" == "app_process64" ]]; then
-                    # Get ARGS for app_process64, skipping any empty lines
-                    args=$(ps -f -eo args -p "$pid" | head -n 2 | tail -n +2)
+            current_top+=("$pid $cpu $cmd")
 
-                    if [ -n "$args" ]; then  # Check if ARGS is not empty
-                        cmd=$(trim_and_extract_command "$args")
-                        if [ -z "$cmd" ]; then  # If cmd is empty after extraction
-                            cmd="app_process64 (no arguments)"  # More informative fallback
-                        fi
-                    else
-                        cmd="app_process64 (no ARGS)"  # More informative fallback
-                    fi
-                else
-                    cmd=$comm
-                fi
+            # Process CPU measurement and get time adjustment
+            process_cpu_measurement "$pid" "$cpu" "$cmd"
+            time_adjustment=$?
 
-                current_top+=("$pid $cpu $cmd")
-
-                # Check if the average CPU usage exceeds the threshold and if measurements limit is reached
-                if (( measurements_count[$pid] >= MEASUREMENTS_LIMIT )); then
-                    avg_cpu=$(echo "${avg_cpu_usage[$pid]} / ${measurements_count[$pid]}" | bc -l)
-                    formatted_avg_cpu=$(printf "%.2f" "$avg_cpu")  # Format to two decimal places
-                    # Determine the kill condition based on user
-                    if [[ "$cmd" == "system_server" ]]; then
-                        # For system user, check if avg CPU usage is greater than double the threshold
-                        if (( $(echo "$avg_cpu > $((CPU_THRESHOLD * $HIGH_PRIORITY_MULTIPLIER))" | bc -l) )) && [ "$SYSTEM_INSTABILITY_REPORTED" -eq 0 ]; then
-                            echo "$(date '+%Y-%m-%d %H:%M:%S') Reporting the system as unstable… $cmd is using $formatted_avg_cpu% of the CPU on average."
-                            TIME_SPENT=$((TIME_SPENT - 10))  # Add 10 seconds to monitor duration
-                            setenforce 0    # I need to set SELinux Enforcing to Permissive for a second for the notification to show.
-                            su
-                            su -lp 2000 -c "cmd notification post -S bigtext -t 'High CPU Usage Detected' 'Tag' 'The process $cmd is using a high amount of CPU (Average Usage: $formatted_avg_cpu%). It can not be killed without causing a reboot. To debug it, use \"top -H\" via ADB.'"
-                            setenforce $ORIGINAL_SELINUX
-                            SYSTEM_INSTABILITY_REPORTED=1
-                        fi
-                    else
-                        # For other users, check if avg CPU usage is greater than the threshold
-                        if (( $(echo "$avg_cpu > $CPU_THRESHOLD" | bc -l) )); then
-                            # Get the currently playing media package name
-                            playing_media_package=$(get_playing_media_package_name)                    
-                            # Compare the command with the playing media package
-                            if [[ "$cmd" == "$playing_media_package" ]]; then
-                                echo "The package to be killed $cmd is playing media. Skipping…"
-                            else
-                                echo "$(date '+%Y-%m-%d %H:%M:%S') Killing process $cmd (Average CPU usage: $formatted_avg_cpu%)"
-                                kill "$pid"  # Kill the process
-                                # I need to set SELinux Enforcing to Permissive for a second for the notification to show.
-                                setenforce 0    # I need to set SELinux Enforcing to Permissive for a second for the notification to show.
-                                su
-                                su -lp 2000 -c "cmd notification post -S bigtext -t '$cmd Killed' 'Tag' 'Average CPU Usage: $formatted_avg_cpu%'"
-                                setenforce $ORIGINAL_SELINUX
-                            fi
-                            TIME_SPENT=$((TIME_SPENT - 10))  # Add 10 seconds to monitor duration so it checks another process.
-                        fi
-                    fi
-                fi
+            if [ $time_adjustment -eq 10 ]; then
+                TIME_SPENT=$((TIME_SPENT - 10))
             fi
         done <<< "$top_processes"
 
-        # Display the top processes and their average CPU usage
-        echo "Top $TOP_PROCESSES_COUNT CPU-consuming processes:"
-        for entry in "${current_top[@]}"; do
-            read pid cpu cmd <<< "$entry"
-            avg_cpu=$(echo "${avg_cpu_usage[$pid]} / ${measurements_count[$pid]}" | bc -l)
-            # Format AVG-CPU% to 2 decimal places and round off
-            avg_cpu=$(printf "%.2f" "$avg_cpu")
-            # Display both current CPU% and AVG-CPU%
-            echo "PID: $pid, CPU%: $cpu, AVG-CPU%: $avg_cpu, Command: $cmd, Measurements: ${measurements_count[$pid]}"
-        done
+        # Display current top processes
+        display_top_processes "${current_top[@]}"
+
         sleep "$SAMPLE_INTERVAL"
         TIME_SPENT=$((TIME_SPENT + SAMPLE_INTERVAL))
     done
     return 0
 }
 
-# Main loop
-MONITOR_WAIT_TIME=$INITIAL_SLEEP_TIME
-while true; do
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Checking if the system is idle..."
-    should_monitor
-    if [ $? -eq 0 ]; then
-        if [ "$REMAINING_MONITORING_SKIPS" -eq 0 ]; then
-            # Call the monitoring function
-            monitor_and_analyze
-            if [ $? -eq 0 ]; then    # In this case, we can assume the function ended successfully without errors, so we need to increase the skips.
-                if [ $MONITORING_SKIPS -eq 0 ]; then
-                    MONITORING_SKIPS=1
-                else
-                    MONITORING_SKIPS=$((MONITORING_SKIPS * 2))
+##########################################################################################
+# Main Loop
+##########################################################################################
+
+main_loop() {
+    while true; do
+        echo "$(date '+%Y-%m-%d %H:%M:%S') Checking if the system is idle..."
+
+        if should_monitor; then
+            if [ "$REMAINING_MONITORING_SKIPS" -eq 0 ]; then
+                monitor_and_analyze
+                if [ $? -eq 0 ]; then
+                    # Successfully completed monitoring - increase skips exponentially
+                    if [ $MONITORING_SKIPS -eq 0 ]; then
+                        MONITORING_SKIPS=1
+                    else
+                        MONITORING_SKIPS=$((MONITORING_SKIPS * 2))
+                    fi
+                    REMAINING_MONITORING_SKIPS=$MONITORING_SKIPS
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') Increasing the amount of loop skips to $MONITORING_SKIPS…"
                 fi
-                REMAINING_MONITORING_SKIPS=$MONITORING_SKIPS
-                echo "$(date '+%Y-%m-%d %H:%M:%S') Increasing the amount of loop skips to $MONITORING_SKIPS…"
+            else
+                REMAINING_MONITORING_SKIPS=$((REMAINING_MONITORING_SKIPS - 1))
+                echo "$(date '+%Y-%m-%d %H:%M:%S') Skipping this loop. Remaining loop skips: $REMAINING_MONITORING_SKIPS"
             fi
-        else
-            REMAINING_MONITORING_SKIPS=$((REMAINING_MONITORING_SKIPS - 1))
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Skipping this loop. Remaining loop skips: $REMAINING_MONITORING_SKIPS"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Next device idle check in $MONITOR_WAIT_TIME seconds."
         fi
-        echo "$(date '+%Y-%m-%d %H:%M:%S') Next device idle check in $MONITOR_WAIT_TIME seconds."
-    fi
-    sleep "$MONITOR_WAIT_TIME"
-done
+
+        sleep "$MONITOR_WAIT_TIME"
+    done
+}
+
+##########################################################################################
+# Entry Point
+##########################################################################################
+
+init_globals
+main_loop
