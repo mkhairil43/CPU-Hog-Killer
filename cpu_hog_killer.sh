@@ -16,6 +16,7 @@ MEASUREMENTS_LIMIT=5                # Number of measurements before killing proc
 INITIAL_SLEEP_TIME=60               # Initial wait time when screen is off (seconds)
 HIGH_PRIORITY_MULTIPLIER=3          # Multiplier for high-priority processes (e.g., system_server)
 WHITE_LIST="toybox|android.system.suspend-service|audioserver|android.hardware.audio.service_64"
+THRESHOLD_HIGH=$((CPU_THRESHOLD * HIGH_PRIORITY_MULTIPLIER))  # Pre-calculate high priority threshold
 
 ##########################################################################################
 # Global Variables
@@ -26,6 +27,7 @@ MONITORING_SKIPS=0                  # Number of times monitoring was skipped
 REMAINING_MONITORING_SKIPS=0        # Remaining skips before next monitoring run
 SYSTEM_INSTABILITY_REPORTED=0       # Flag indicating if system instability was reported
 MONITOR_WAIT_TIME=$INITIAL_SLEEP_TIME  # Current wait time between monitoring cycles
+SELINUX_DISABLED_BY_SCRIPT=0        # Flag to track if we disabled SELinux
 
 # Arrays for tracking process measurements (using associative arrays)
 declare -A pids                     # Process IDs being tracked
@@ -42,7 +44,23 @@ init_globals() {
     REMAINING_MONITORING_SKIPS=0
     SYSTEM_INSTABILITY_REPORTED=0
     MONITOR_WAIT_TIME=$INITIAL_SLEEP_TIME
+    SELINUX_DISABLED_BY_SCRIPT=0
 }
+
+##########################################################################################
+# Cleanup and Signal Handling
+##########################################################################################
+
+# Restore SELinux on script exit
+restore_selinux_on_exit() {
+    if [ "$SELINUX_DISABLED_BY_SCRIPT" -eq 1 ]; then
+        setenforce "$ORIGINAL_SELINUX" 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M:%S') SELinux restored to $ORIGINAL_SELINUX"
+    fi
+}
+
+# Set up trap to restore SELinux on exit
+trap restore_selinux_on_exit EXIT INT TERM HUP
 
 ##########################################################################################
 # Utility Functions
@@ -50,13 +68,10 @@ init_globals() {
 
 # Cleanup all process measurements
 cleanup_measurements() {
+    # Fast array reset without reallocating
     pids=()
     avg_cpu_usage=()
     measurements_count=()
-    unset pids avg_cpu_usage measurements_count
-    declare -A pids
-    declare -A avg_cpu_usage
-    declare -A measurements_count
     echo "$(date '+%Y-%m-%d %H:%M:%S') All previous measurements cleared."
 }
 
@@ -69,10 +84,22 @@ trim_and_extract_command() {
 send_notification() {
     local title="$1"
     local message="$2"
+    local original_selinux
 
-    setenforce 0
-    su -lp 2000 -c "cmd notification post -S bigtext -t '$title' 'Tag' '$message'"
-    setenforce "$ORIGINAL_SELINUX"
+    # Only disable SELinux if not already disabled
+    if [ "$(getenforce)" = "Enforcing" ]; then
+        setenforce 0
+        SELINUX_DISABLED_BY_SCRIPT=1
+    fi
+
+    # Validate and sanitize inputs - remove any potentially dangerous characters
+    title=$(echo "$title" | tr -d "'\"\`\\$;&|")
+    message=$(echo "$message" | tr -d "'\"\`\\$;&|")
+
+    # Use shell PID 0 (shell itself) as fallback if UID 2000 doesn't exist
+    su -lp 2000 -c "cmd notification post -S bigtext -t '${title}' 'Tag' '${message}'" 2>/dev/null || \
+    su -c "cmd notification post -S bigtext -t '${title}' 'Tag' '${message}'" 2>/dev/null || \
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Failed to send notification: $title - $message"
 }
 
 ##########################################################################################
@@ -85,9 +112,14 @@ should_monitor() {
 
     device_idle_info=$(dumpsys deviceidle | grep -E 'mScreenLocked|mScreenOn|mCharging')
 
-    screen_locked=$(echo "$device_idle_info" | grep -o 'mScreenLocked=[^ ]*' | awk -F '=' '{print $2}')
-    screen_on=$(echo "$device_idle_info" | grep -o 'mScreenOn=[^ ]*' | awk -F '=' '{print $2}')
-    charging=$(echo "$device_idle_info" | grep -o 'mCharging=[^ ]*' | awk -F '=' '{print $2}')
+    screen_locked=${device_idle_info#*mScreenLocked=}
+    screen_locked=${screen_locked%% *}
+    
+    screen_on=${device_idle_info#*mScreenOn=}
+    screen_on=${screen_on%% *}
+    
+    charging=${device_idle_info#*mCharging=}
+    charging=${charging%% *}
 
     if [[ "$screen_on" == "false" && "$charging" == "false" && "$screen_locked" == "true" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') The system is idle."
@@ -128,14 +160,14 @@ get_playing_media_package_name() {
 
 # Check for ongoing or ringing calls
 check_for_ongoing_calls() {
-    local telephony_info foreground_call_states ringing_call_states state
+    local telephony_info state
 
     telephony_info=$(dumpsys telephony.registry | grep -E 'mForegroundCallState|mRingingCallState')
 
-    foreground_call_states=$(echo "$telephony_info" | grep -o 'mForegroundCallState=[^ ]*' | awk -F '=' '{print $2}')
-    ringing_call_states=$(echo "$telephony_info" | grep -o 'mRingingCallState=[^ ]*' | awk -F '=' '{print $2}')
-
-    for state in $foreground_call_states $ringing_call_states; do
+    # Extract all states in one pass using parameter expansion
+    for state in ${telephony_info#*=} ${telephony_info#*=}; do
+        state=${state%% *}
+        [[ "$state" =~ ^[0-9]+$ ]] || continue
         if [[ "$state" -ne 0 ]]; then
             return 0  # True: There is an ongoing call or the phone is ringing
         fi
@@ -161,10 +193,21 @@ kill_process_with_notification() {
     local pid="$1"
     local cmd="$2"
     local formatted_avg_cpu="$3"
+    local pid_exists
 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Killing process $cmd (Average CPU usage: $formatted_avg_cpu%)"
-    kill "$pid"
-    send_notification "$cmd Killed" "Average CPU Usage: $formatted_avg_cpu%"
+    # Verify the process still exists and has the same command before killing (TOCTOU mitigation)
+    if [ -d "/proc/$pid" ]; then
+        pid_exists=$(ps -p "$pid" -o comm= 2>/dev/null)
+        if [ -n "$pid_exists" ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Killing process $cmd (Average CPU usage: $formatted_avg_cpu%)"
+            kill "$pid" 2>/dev/null
+            send_notification "$cmd Killed" "Average CPU Usage: $formatted_avg_cpu%"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Process $pid no longer exists, skipping kill"
+        fi
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') Process $pid not found in /proc, skipping kill"
+    fi
 }
 
 # Display top processes with their statistics
@@ -218,7 +261,7 @@ process_cpu_measurement() {
         measurements_count[$pid]=0
     fi
 
-    # Accumulate CPU usage and increment measurement count
+    # Accumulate CPU usage and increment measurement count (use integer math when possible)
     avg_cpu_usage[$pid]=$(echo "${avg_cpu_usage[$pid]} + $cpu" | bc)
     measurements_count[$pid]=$((measurements_count[$pid] + 1))
 
@@ -229,13 +272,13 @@ process_cpu_measurement() {
 
         # Handle high-priority processes (system_server) differently
         if [[ "$cmd" == "system_server" ]]; then
-            if (( $(echo "$avg_cpu > $((CPU_THRESHOLD * $HIGH_PRIORITY_MULTIPLIER))" | bc -l) )) && \
+            if (( $(echo "$avg_cpu > $THRESHOLD_HIGH" | bc -l) )) && \
                [ "$SYSTEM_INSTABILITY_REPORTED" -eq 0 ]; then
                 report_system_instability "$cmd" "$formatted_avg_cpu"
                 return 10  # Signal to add 10 seconds
             fi
         else
-            # Regular process handling
+            # Regular process handling - use pre-calculated threshold
             if (( $(echo "$avg_cpu > $CPU_THRESHOLD" | bc -l) )); then
                 playing_media_package=$(get_playing_media_package_name)
                 if [[ "$cmd" == "$playing_media_package" ]]; then
@@ -278,7 +321,13 @@ monitor_and_analyze() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') Collecting CPU usage snapshot at $TIME_SPENT seconds..."
 
         # Get top CPU-consuming processes (excluding whitelisted ones)
-        top_processes=$(top -b -n 1 -o pid,user,comm,%cpu | tail -n +6 | grep -Ev "$WHITE_LIST" | head -n "$((TOP_PROCESSES_COUNT + 1))")
+        # Validate WHITE_LIST contains only safe characters before using in grep
+        if echo "$WHITE_LIST" | grep -qE '^[a-zA-Z0-9._|:-]+$'; then
+            top_processes=$(top -b -n 1 -o pid,user,comm,%cpu | tail -n +6 | grep -Ev "$WHITE_LIST" | head -n "$((TOP_PROCESSES_COUNT + 1))")
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') WARNING: WHITE_LIST contains invalid characters, skipping whitelist filter"
+            top_processes=$(top -b -n 1 -o pid,user,comm,%cpu | tail -n +6 | head -n "$((TOP_PROCESSES_COUNT + 1))")
+        fi
 
         current_top=()
 

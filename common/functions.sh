@@ -44,13 +44,17 @@ device_check() {
       *) abort "Invalid device_check argument $1! Aborting!";;
     esac
   done
-  local prop=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+  # Validate and sanitize input - allow only alphanumeric characters, dots, underscores, and hyphens
+  local prop=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
+  if [ -z "$prop" ]; then
+    abort "Invalid device_check property! Aborting!"
+  fi
   for i in /system /vendor /odm /product; do
-    if [ -f $i/build.prop ]; then
+    if [ -f "$i/build.prop" ]; then
       for j in "ro.product.$type" "ro.build.$type" "ro.product.vendor.$type" "ro.vendor.product.$type"; do
-        [ "$(sed -n "s/^$j=//p" $i/build.prop 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')" == "$prop" ] && return 0
+        [ "$(sed -n "s/^$j=//p" "$i/build.prop" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')" == "$prop" ] && return 0
       done
-      [ "$type" == "device" ] && [ "$(sed -n "s/^"ro.build.product"=//p" $i/build.prop 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')" == "$prop" ] && return 0
+      [ "$type" == "device" ] && [ "$(sed -n "s/^"ro.build.product"=//p" "$i/build.prop" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')" == "$prop" ] && return 0
     fi
   done
   return 1
@@ -68,24 +72,40 @@ cp_ch() {
     esac
   done
   local SRC="$1" DEST="$2" OFILES="$1"
-  $FOL && local OFILES=$(find $SRC -type f 2>/dev/null)
-  [ -z $3 ] && PERM=0644 || PERM=$3
+  
+  # Validate SRC and DEST paths to prevent path traversal
+  case "$SRC" in
+    /*) ;; # Absolute path is OK
+    *) abort "cp_ch requires absolute paths! Aborting!";;
+  esac
+  case "$DEST" in
+    /*) ;; # Absolute path is OK
+    *) abort "cp_ch requires absolute paths! Aborting!";;
+  esac
+  
+  # Check for path traversal attempts
+  if echo "$SRC$DEST" | grep -q '\.\.'; then
+    abort "Path traversal detected! Aborting!"
+  fi
+  
+  $FOL && local OFILES=$(find "$SRC" -type f 2>/dev/null)
+  [ -z "$3" ] && PERM=0644 || PERM="$3"
   case "$DEST" in
     $TMPDIR/*|$MODULEROOT/*|$NVBASE/modules/$MODID/*) BAK=false;;
   esac
-  for OFILE in ${OFILES}; do
+  for OFILE in "${OFILES}"; do
     if $FOL; then
-      if [ "$(basename $SRC)" == "$(basename $DEST)" ]; then
-        local FILE=$(echo $OFILE | sed "s|$SRC|$DEST|")
+      if [ "$(basename "$SRC")" == "$(basename "$DEST")" ]; then
+        local FILE=$(echo "$OFILE" | sed "s|$SRC|$DEST|")
       else
-        local FILE=$(echo $OFILE | sed "s|$SRC|$DEST/$(basename $SRC)|")
+        local FILE=$(echo "$OFILE" | sed "s|$SRC|$DEST/$(basename "$SRC")|")
       fi
     else
-      [ -d "$DEST" ] && local FILE="$DEST/$(basename $SRC)" || local FILE="$DEST"
+      [ -d "$DEST" ] && local FILE="$DEST/$(basename "$SRC")" || local FILE="$DEST"
     fi
     if $BAK && $UBAK; then
       [ ! "$(grep "$FILE$" $INFO 2>/dev/null)" ] && echo "$FILE" >> $INFO
-      [ -f "$FILE" -a ! -f "$FILE~" ] && { mv -f $FILE $FILE~; echo "$FILE~" >> $INFO; }
+      [ -f "$FILE" -a ! -f "$FILE~" ] && { mv -f "$FILE" "$FILE~"; echo "$FILE~" >> $INFO; }
     elif $BAK; then
       [ ! "$(grep "$FILE$" $INFO 2>/dev/null)" ] && echo "$FILE" >> $INFO
     fi
